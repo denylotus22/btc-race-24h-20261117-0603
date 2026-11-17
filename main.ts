@@ -12,6 +12,9 @@
 //   - Stop-loss: sell the whole position if the close falls 2% below the close
 //     at which the current position was opened (protects the live race from a
 //     real breakdown; it never fired on the published dev window).
+//   - Trailing exit: sell the whole position if the close falls 2% below
+//     the highest close since entry, so a run-up is not given back while
+//     RSI stays below 75 (also never fired on the published dev window).
 // Warm-up bars are used to build RSI history only; no order is sent while
 // warming up. The replay flattens any open position at the end of the window.
 //
@@ -27,6 +30,8 @@ const RSI_BUY_BELOW = 30;
 const RSI_SELL_ABOVE = 75;
 // Sell if the close drops this far below the entry close (basis points).
 const STOP_LOSS_BPS = 200;
+// Sell if the close falls this far below the highest close since entry.
+const TRAIL_BPS = 200;
 const MAX_SLIPPAGE_BPS = 10_000;
 
 // Rolling Wilder RSI state, updated once per bar from the latest close.
@@ -65,11 +70,14 @@ class RsiTracker {
 const rsi = new RsiTracker();
 // Close (raw units) at which the current position was opened; null when flat.
 let entryClose: bigint | null = null;
+// Highest close seen since the current position was opened; null when flat.
+let peakClose: bigint | null = null;
 
 function sellAll(state: BarsState): OrderInput[] {
   const held = state.positions.get(SYMBOL);
   if (!held || held.qty === 0n) return [];
   entryClose = null;
+  peakClose = null;
   return [{ side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
 }
 
@@ -79,6 +87,7 @@ function buyAll(state: BarsState, close: bigint): OrderInput[] {
   const amount = state.cash < byWeight ? state.cash : byWeight;
   if (amount === 0n || amount < BigInt(fees.min_notional_quote_units)) return [];
   entryClose = close;
+  peakClose = close;
   return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: amount, max_slippage_bps: MAX_SLIPPAGE_BPS }];
 }
 
@@ -96,8 +105,10 @@ await runBars({
     if (value === null) return []; // RSI not seeded yet.
     const holding = state.positions.has(SYMBOL);
     if (holding) {
+      if (peakClose !== null && close > peakClose) peakClose = close;
       const stopLine = entryClose !== null ? (entryClose * BigInt(10_000 - STOP_LOSS_BPS)) / 10_000n : null;
-      if (value > RSI_SELL_ABOVE || (stopLine !== null && close < stopLine)) {
+      const trailLine = peakClose !== null ? (peakClose * BigInt(10_000 - TRAIL_BPS)) / 10_000n : null;
+      if (value > RSI_SELL_ABOVE || (stopLine !== null && close < stopLine) || (trailLine !== null && close < trailLine)) {
         return sellAll(state);
       }
       return [];
